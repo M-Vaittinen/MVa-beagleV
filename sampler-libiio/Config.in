@@ -1,0 +1,8 @@
+config BR2_PACKAGE_SAMPLER_LIBIIO
+    bool "Sampler LibIIO"
+    select BR2_PACKAGE_LIBXML2
+    select BR2_TOOLCHAIN_HAS_THREADS
+    select BR2_PACKAGE_LIBAIO
+    select BR2_PACKAGE_ZSTD
+    help
+      LibIIO v1.0 and IIO Daemon.
