@@ -1,0 +1,6 @@
+#!/bin/sh
+
+echo 60010000.dma-controller > /sys/bus/platform/drivers/uio_pdrv_genirq/unbind
+echo 60000000.sampler > /sys/bus/platform/drivers/uio_pdrv_genirq/unbind
+
+modprobe dma-sampler

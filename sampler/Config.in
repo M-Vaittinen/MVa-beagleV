@@ -1,0 +1,5 @@
+config BR2_PACKAGE_SAMPLER
+    bool "Sampler"
+    select BR2_PACKAGE_SAMPLER_LIBIIO
+    help
+      Sampler package.
