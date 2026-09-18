@@ -184,3 +184,69 @@ design decisions / assumptions that need confirmation:
    devm_platform_ioremap_resource()/of_address_to_resource()/
    of_property_match_string() signatures for the 6.12-based microchip
    kernel) before relying on it.
+
+DMA-sampler-dmaengine IIO driver (drivers/iio/adc/dma-sampler-dmaengine.c)
+===========================================================================
+
+This is the NEW, plain-dmaengine-consumer IIO driver, parallel to (not a
+replacement for) dma-sampler.c, requesting a channel from
+fpga-sampler-dma.c via dma_request_chan() instead of poking FPGA DMA
+registers itself. It shares most open items with fpga-sampler-dma.c
+above (untested, "half ready" signalling, 32-bit address truncation,
+first-sample-discard) plus the following, specific to this file:
+
+7. Bypasses the generic industrialio-buffer-dmaengine.c helper
+   -----------------------------------------------------------------
+   include/linux/iio/buffer-dmaengine.h + drivers/iio/buffer/
+   industrialio-buffer-dmaengine.c is the "standard" way an IIO driver
+   is expected to consume a dmaengine channel, but it only drives
+   providers that implement device_prep_slave_sg()/
+   device_prep_peripheral_dma_vec() (one-shot, per-block descriptors).
+   fpga-sampler-dma.c deliberately only implements DMA_CYCLIC, matching
+   the FPGA's free-running ping-pong hardware, so that generic helper
+   cannot be used here. This driver instead submits ONE persistent
+   dmaengine_prep_dma_cyclic() descriptor spanning the whole ping-pong
+   buffer in ->postenable, and demultiplexes samples out of it manually
+   in the per-period callback. This is a deliberate, but non-standard,
+   design choice - please confirm it is acceptable, or consider instead
+   extending fpga-sampler-dma.c with a device_prep_slave_sg()-style
+   one-shot mode so the generic helper (and its associated mmap/
+   zero-copy DMA buffer support) could be used instead.
+
+8. kfifo buffer + per-sample iio_push_to_buffers() vs. DMA-buffer/mmap
+   -----------------------------------------------------------------
+   Because the generic dmaengine IIO buffer helper isn't used (see item
+   7), this driver falls back to a plain software kfifo buffer
+   (devm_iio_kfifo_buffer_setup()) and pushes samples one at a time via
+   iio_push_to_buffers() from the DMA completion callback
+   (fpga_sampler_dmaengine_period_done()). This works but reintroduces
+   a per-sample copy that a "real" DMA-mapped/mmap'd IIO buffer (as
+   dma-sampler.c already provides via iio_dma_buffer_*) would avoid.
+   At the target sample rates (up to 1 Msps) this copy overhead should
+   be measured/benchmarked before deciding this is an acceptable
+   trade-off for production use.
+
+9. dma_alloc_coherent() ping-pong buffer allocated/freed every
+   buffer enable/disable cycle
+   -----------------------------------------------------------------
+   fpga_sampler_dmaengine_postenable()/predisable() allocate and free
+   the coherent DMA buffer on every buffer enable/disable, unlike
+   dma-sampler.c (which reuses pre-allocated iio_dma_buffer_block
+   objects across enable/disable cycles). This is simpler but means
+   repeated buffer enable/disable cycles will repeatedly hit
+   dma_alloc_coherent()/dma_free_coherent(), which may be slower and is
+   more prone to fragmentation-related allocation failures than a
+   buffer allocated once at probe() time. Consider moving the
+   allocation to probe()/remove() if this driver is taken further.
+
+10. No verification that dma_chan capacity/geometry matches at
+    channel-request time
+   -----------------------------------------------------------------
+   dma_request_chan(dev, "rx") only checks that a channel exists by
+   name; whether fpga-sampler-dma.c's device_prep_dma_cyclic() actually
+   accepts SAMPLER_BUFFER_BYTE_COUNT/_HALF as buf_len/period_len is only
+   discovered later, in fpga_sampler_dmaengine_postenable(), when
+   dmaengine_prep_dma_cyclic() returns NULL on mismatch. This driver
+   treats that as -EIO without a more specific/actionable error message;
+   consider surfacing dmac->lsram_size (or similar) through a capability
+   query if this becomes a debugging pain point.
