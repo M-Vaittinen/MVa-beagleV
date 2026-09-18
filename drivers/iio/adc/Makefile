@@ -51,6 +51,11 @@ obj-$(CONFIG_CPCAP_ADC) += cpcap-adc.o
 obj-$(CONFIG_DA9150_GPADC) += da9150-gpadc.o
 obj-$(CONFIG_DLN2_ADC) += dln2-adc.o
 obj-m += dma-sampler.o
+# Alternative implementation of dma-sampler using the plain dmaengine API
+# (against drivers/dma/fpga-sampler-dma.c) instead of direct FPGA DMA
+# register access; kept as a separate module for design comparison, see
+# TODO-dmaengine-only-plan.txt.
+obj-m += dma-sampler-dmaengine.o
 obj-$(CONFIG_ENVELOPE_DETECTOR) += envelope-detector.o
 obj-$(CONFIG_EP93XX_ADC) += ep93xx_adc.o
 obj-$(CONFIG_EXYNOS_ADC) += exynos_adc.o
