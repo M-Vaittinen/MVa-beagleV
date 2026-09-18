@@ -1,0 +1,130 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+/* Copyright (c) 2020-2021 Microchip Technology Inc */
+
+/*
+ * FPGA fabric device-tree overlay for the "IIO / dmaengine / SPI-offload"
+ * production path, as designed in dma-devicetree-design.txt.
+ *
+ * This is a companion overlay to
+ * .../MEM_INTERFACE/DEFAULT/device-tree-overlay/mem-access-overlay.dtso
+ * (the existing UIO + udmabuf debug path), NOT a replacement for it. Both
+ * overlays describe the exact same physical FPGA blocks (sampler @
+ * 0x60000000, DMA controller @ 0x60010000, LSRAM @ 0x80000000, DDR pool @
+ * 0xc8000000) but bind them to different drivers:
+ *
+ *   mem-access-overlay.dtso (existing) -> "generic-uio" + u-dma-buf
+ *   iio-mem-access-overlay.dtso (this) -> rohm,fpga-adc-sampler +
+ *                                          rohm,fpga-sampler-dma
+ *
+ * Only ONE of the two overlays may be active (status = "okay") at a time,
+ * since both claim the same MMIO ranges - see dma-devicetree-design.txt,
+ * "keep two selectable overlays" for the reasoning and boot-time
+ * selection approach. Which overlay is applied should be chosen at boot
+ * (U-Boot overlay selection), not decided by driver code.
+ *
+ * See TO-CLARIFY.txt in this same directory for the list of items that
+ * could not be confirmed from currently-available sources and must be
+ * verified against the FPGA gateware / hardware team before this overlay
+ * is used for real.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&{/chosen} {
+	overlays {
+		MEM-ACCESS-GATEWARE = "GATEWARE_GIT_VERSION";
+	};
+};
+
+&{/} {
+	fabric-bus@40000000 {
+		fpgadma: dma-controller@60010000 {
+			compatible = "rohm,fpga-sampler-dma";
+			reg = <0x0 0x60010000 0x0 0x1000>;
+			interrupt-parent = <&plic>;
+			interrupts = <121>;
+
+			/*
+			 * Single, fixed-function channel with no per-request
+			 * parameters to encode -> 0 cells. See
+			 * dma-devicetree-design.txt point 3 / TO-CLARIFY.txt.
+			 */
+			#dma-cells = <0>;
+			dma-channels = <1>;
+
+			/*
+			 * Phandle to the FPGA sampler node, used by
+			 * drivers/dma/fpga-sampler-dma.c to resolve the
+			 * "lsram" reg window below (the DMA source aperture)
+			 * without hard-coding its address in the driver. This
+			 * is a new, driver-specific property - not part of
+			 * the generic dma-controller binding - see
+			 * TO-CLARIFY.txt, "DMA-engine provider" section.
+			 */
+			rohm,sampler = <&fpgasampler>;
+
+			status = "disabled";
+		};
+
+		fpgasampler: sampler@60000000 {
+			compatible = "rohm,fpga-adc-sampler";
+
+			/*
+			 * Two windows on the same FPGA IP block:
+			 *  "ctrl"  - control/status registers (CONTROL,
+			 *            STATUS, CAPTURE_COUNT, SPI_RATE_SEL,
+			 *            SPI_TX_WORD, ...), as used today by
+			 *            dma-sampler.c's SAMPLER_ADDRESS.
+			 *  "lsram" - the DMA-source data aperture the ADC
+			 *            samples land in, matching
+			 *            dma-sampler.c's DMA_SOURCE_ADDRESS /
+			 *            SAMPLER_BUFFER_BYTE_COUNT (18432 words x
+			 *            4 samples/word x 2 bytes/sample =
+			 *            0x24000 bytes).
+			 */
+			reg = <0x0 0x60000000 0x0 0x1000>,
+			      <0x0 0x80000000 0x0 0x24000>;
+			reg-names = "ctrl", "lsram";
+
+			interrupt-parent = <&plic>;
+			interrupts = <122>;
+
+			/* DDR ping-pong target buffer, see reserved-memory
+			 * node below. Reused verbatim from the existing UIO
+			 * overlay's fabricbuf1ddrnc region. */
+			memory-region = <&fabricbuf1ddrnc>;
+
+			/* Request our one DMA channel by name; provider side
+			 * is fpgadma above (#dma-cells = <0>, so no extra
+			 * cell is needed here). */
+			dmas = <&fpgadma>;
+			dma-names = "rx";
+
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		/*
+		 * Same reservation as mem-access-overlay.dtso's
+		 * fabricbuf1ddrnc. Kept at the same address/size so the two
+		 * overlays remain mutually exclusive alternatives rather
+		 * than needing two disjoint DDR carve-outs; see
+		 * dma-devicetree-design.txt point 2.
+		 */
+		fabricbuf1ddrnc: buffer@c8000000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0xc8000000 0x0 0x2000000>;
+			no-map;
+		};
+	};
+};
+
+&fpgadma {
+	status = "okay";
+};
+
+&fpgasampler {
+	status = "okay";
+};
