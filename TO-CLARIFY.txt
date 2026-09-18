@@ -1,0 +1,186 @@
+TO-CLARIFY: open items for mva-ext-dtso/ and drivers/dma/fpga-sampler-dma.c
+=============================================================================
+
+This file has two sections:
+  - "Device tree" - open items about mva-ext-dtso/iio-mem-access-overlay.dtso
+  - "DMA-engine provider" - open items about the register writes and
+    device-tree consumption added to drivers/dma/fpga-sampler-dma.c
+
+===============================================================================
+SECTION: Device tree
+===============================================================================
+
+The overlay in mva-ext-dtso/ was drafted from existing repo sources
+(mem-access-overlay.dtso, drivers/iio/adc/dma-sampler.c, and
+dma-devicetree-design.txt / TODO-spi-offload.txt), but several details
+could not be confirmed from those sources alone. Please verify the
+following before using this overlay for real hardware bring-up:
+
+1. LSRAM aperture address/size (reg "lsram", 0x80000000 / 0x24000)
+   -----------------------------------------------------------------
+   Derived from dma-sampler.c's compile-time constants:
+     DMA_SOURCE_ADDRESS       = 0x80000000
+     SAMPLER_LSRAM_WORD_COUNT = 18432
+     SAMPLER_SAMPLES_PER_LSRAM_WORD = 4
+     SAMPLER_BUFFER_BYTE_COUNT = 18432 * 4 * 2 = 0x24000 bytes
+   These are driver-side constants matched against a specific FPGA
+   gateware build; I could not find an authoritative FPGA-side address
+   map (e.g. a gateware register/memory-map document) confirming this
+   is the LSRAM's actual bus address as seen by the DMA controller, or
+   that it is stable across gateware revisions. Please confirm with the
+   FPGA design team, or point me at the gateware memory map if one
+   exists in ../a2d/beagleVFire/sources/FPGA-design.
+
+2. #dma-cells value (chosen: 0)
+   -----------------------------
+   Chose 0 cells (no per-request parameters) because the FPGA DMA IP
+   appears to expose exactly one, fixed-function channel with no
+   selectable modes/indices anywhere in dma-sampler.c or the UIO tool.
+   If a future/actual gateware revision exposes multiple channels or a
+   channel-select/flags parameter, this should become
+   `#dma-cells = <1>` (or more) and the `dmas = <&fpgadma>;` reference
+   in the sampler node would need an extra cell, e.g.
+   `dmas = <&fpgadma 0>;`.
+
+3. Clocks / resets for the DMA controller and sampler nodes
+   ---------------------------------------------------------
+   No `clocks`/`clock-names`/`resets` properties were added because none
+   were found referenced in dma-sampler.c, the UIO overlay, or the
+   uio-adc-sampler-control tool. If the FPGA fabric-bus infrastructure
+   actually requires the kernel to explicitly enable a fabric clock (or
+   deassert a reset) for these IP blocks to function, that is currently
+   handled outside of Linux (e.g. always-on fabric clock, or set up by
+   firmware/HSS before Linux boots) - please confirm this assumption
+   holds, or supply the correct clock/reset bindings if not.
+
+4. `reg-names`/multi-window binding for the sampler node
+   -------------------------------------------------------
+   Splitting the sampler's `reg` into two named windows ("ctrl" +
+   "lsram") is a binding *I introduced* to match how dma-sampler.c
+   internally treats SAMPLER_ADDRESS and DMA_SOURCE_ADDRESS as separate
+   apertures of the same logical block. There is no existing precedent
+   for this in the repo (mem-access-overlay.dtso only lists the ctrl
+   window for the sampler, since UIO never accessed LSRAM directly via
+   mmap in the sampler node - the DMA controller did the addressing
+   instead). This binding is a NEW proposal and has not been reviewed
+   against any actual bindings documentation/schema (no
+   Documentation/devicetree/bindings/iio/adc/rohm,fpga-adc-sampler.yaml
+   exists yet - would need to be authored before upstreaming, but is
+   fine for local/out-of-tree use in the meantime).
+
+5. Whether the "lsram" reg window should live on the sampler node at all
+   -----------------------------------------------------------------------
+   An alternative design would keep LSRAM addressing entirely internal
+   to the DMA-engine provider node (fpgadma) instead of the sampler node,
+   since it's the DMA controller, not the sampler, that actually reads
+   LSRAM as a DMA source. I put it on the sampler node because
+   dma-sampler.c's `st->half`/ping-pong bookkeeping today lives in the
+   IIO driver, which is the natural place to compute the correct LSRAM
+   half-offset before calling into the DMA API - but this is a design
+   choice, not a hard requirement, and should be revisited once the
+   actual SPI-offload consumer/provider split is implemented (see
+   TODO-spi-offload.txt step 3).
+
+6. reg/interrupt numbers themselves (0x60000000/0x60010000/0x80000000,
+   IRQ 121/122)
+   -----------------------------------------------------------------------
+   Copied verbatim from mem-access-overlay.dtso and dma-sampler.c; these
+   are almost certainly correct for the current gateware build actually
+   in use, but were not independently re-derived/verified against a
+   gateware build artifact in this pass.
+
+None of the above block using this overlay for early bring-up/experiments
+(the values used are the best available from existing sources), but they
+should be confirmed - especially items 1-2 - before relying on this
+overlay for anything beyond initial driver development.
+
+===============================================================================
+SECTION: DMA-engine provider (drivers/dma/fpga-sampler-dma.c)
+===============================================================================
+
+The skeleton driver was filled in with real register writes (mirrored
+from dma-sampler.c's dma_sampler_start_transfer()/dma_sampler_irq_handler())
+and now obtains its register window and LSRAM source address/size from
+device tree instead of hard-coded constants. This introduced several new
+design decisions / assumptions that need confirmation:
+
+1. No hardware "half ready" polling before starting a transfer
+   -----------------------------------------------------------------
+   dma_sampler_start_transfer() in dma-sampler.c busy-waits on
+   dma_sampler_buffer_is_ready() (SAMPLER_STATUS_REG bits 5/6) before
+   programming each DMA transfer. fpga_sampler_dma_start_transfer() in the
+   new driver does NOT do this, because that status register lives in
+   the *sampler* device's MMIO window (0x60000000), which this DMA
+   driver has no handle to (only the sampler driver maps it). As written,
+   the new driver will kick off a transfer immediately when a period
+   completes/is issued, without checking that the FPGA has actually
+   finished writing that LSRAM half - this could read stale or
+   in-progress data if the ADC/SPI side is slower than assumed.
+   Two possible fixes, need a decision:
+     a) Also map SAMPLER_STATUS_REG in this DMA driver (would need a
+        second phandle/reg reference to the sampler's "ctrl" window, or
+        a small register-level API exposed by the sampler driver), or
+     b) Make the readiness signal an explicit hardware trigger (e.g. via
+        the planned SPI-offload trigger mechanism - see
+        TODO-spi-offload.txt) so the DMA driver is only ever kicked once
+        the sampler side is already known-ready, rather than the DMA
+        driver polling a status register itself.
+   Not resolved in this pass - flagged as the most important open item.
+
+2. Transfer/abort semantics for terminate_all()
+   -----------------------------------------------------------------
+   No documented hardware bit was found for "abort an in-flight DMA
+   descriptor" (dma-sampler.c never needed one, since it never
+   implemented dmaengine's terminate_all() concept - its abort() just
+   walks its own driver-private block list). fpga_sampler_dma_terminate_all()
+   currently only masks the completion interrupt and drops the software
+   descriptor pointer; an already-started hardware transfer will still
+   run to completion in silence. If the DMA IP has an actual "cancel/
+   reset" register/bit, please point it out so terminate_all() can use
+   it for a cleaner, faster abort.
+
+3. `rohm,sampler` phandle property (new, driver-specific)
+   -----------------------------------------------------------------
+   Added a custom devicetree property (not part of any generic/upstream
+   binding) on the `fpgadma` node, `rohm,sampler = <&fpgasampler>;`, so
+   fpga_sampler_dma_of_get_lsram() can find the sampler node and read its
+   "lsram"-named reg entry. This creates a cross-reference in the
+   opposite direction of the normal `dmas`/`dma-names` consumer->provider
+   link (sampler node references the DMA node via `dmas`, and now the
+   DMA node also references the sampler node back via `rohm,sampler`).
+   This works but is unusual; an alternative would be to instead
+   duplicate the LSRAM reg/size directly onto the `fpgadma` node itself
+   (avoiding the back-reference, at the cost of listing the same address
+   in two places in the devicetree). Please confirm which approach is
+   preferred, especially if this binding is ever meant to be upstreamed
+   or formally documented.
+
+4. `#dma-cells = <0>` and of_dma_simple_xlate() assumption
+   -----------------------------------------------------------------
+   probe() registers via of_dma_controller_register() using the generic
+   of_dma_simple_xlate() helper, which is only correct for `#dma-cells =
+   <0>` (as currently declared in the overlay). If the DT design changes
+   to `#dma-cells = <1>` per TO-CLARIFY.txt item 2 (device-tree section),
+   this xlate function and the "dmas = <&fpgadma>;" consumer property
+   would both need to change together.
+
+5. Byte counts/addresses assumed to fit in 32 bits
+   -----------------------------------------------------------------
+   DMA_DESC_0_SOURCE_ADDR_REG/DEST_ADDR_REG/BYTE_COUNT_REG are all
+   written with plain 32-bit iowrite32() calls (matching dma-sampler.c's
+   existing use of `u32 src, dst`), using lower_32_bits() to truncate the
+   dma_addr_t/resource_size_t values obtained from device tree. This
+   preserves today's behavior but assumes the DMA IP genuinely only
+   supports 32-bit addressing (true today given DMA_SOURCE_ADDRESS/
+   DMA_DESTINATION_OFFSET are within the low 4GB) - if the DDR target
+   region or LSRAM address ever moves above 4GB, this driver (and
+   dma-sampler.c before it) would silently truncate addresses.
+
+6. This driver has not been compiled or tested
+   -----------------------------------------------------------------
+   Per the environment constraints for this session, none of this code
+   has been build-tested. Please compile it against the actual kernel
+   tree on the build host and fix any API mismatches (e.g. exact
+   devm_platform_ioremap_resource()/of_address_to_resource()/
+   of_property_match_string() signatures for the 6.12-based microchip
+   kernel) before relying on it.
