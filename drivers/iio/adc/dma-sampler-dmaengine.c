@@ -58,6 +58,7 @@
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
+#include <linux/io.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -471,7 +472,7 @@ static int fpga_sampler_dmaengine_probe(struct platform_device *pdev)
 
 	st = iio_priv(indio_dev);
 
-	indio_dev->name = "dma-sampler-dmaengine";
+	indio_dev->name = "sampler-dmaengine";
 	indio_dev->modes = INDIO_BUFFER_SOFTWARE;
 	indio_dev->info = &dma_sampler_info;
 	indio_dev->channels = dma_sampler_channels;
@@ -524,20 +525,20 @@ static int fpga_sampler_dmaengine_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id dma_sampler_dmaengine_of_match[] = {
-	{ .compatible = "rohm,dma-sampler-dmaengine" },
+	{ .compatible = "rohm,sampler-dmaengine" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, dma_sampler_dmaengine_of_match);
 
 static const struct platform_device_id dma_sampler_dmaengine_devices_ids[] = {
-	{ .name = "dma-sampler-dmaengine" },
+	{ .name = "sampler-dmaengine" },
 	{ }
 };
 MODULE_DEVICE_TABLE(platform, dma_sampler_dmaengine_devices_ids);
 
 static struct platform_driver dma_sampler_dmaengine_driver = {
 	.driver = {
-		.name = "dma-sampler-dmaengine",
+		.name = "sampler-dmaengine",
 		.of_match_table = dma_sampler_dmaengine_of_match,
 	},
 	.probe = fpga_sampler_dmaengine_probe,
