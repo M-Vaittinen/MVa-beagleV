@@ -112,7 +112,7 @@
  * reg window (the DMA source aperture, @ 0x80000000 today - see
  * mva-ext-dtso/iio-mem-access-overlay.dtso's `fpgasampler` node). This is
  * a NEW property, not present in the existing dtso as originally
- * drafted - see mva-ext-dtso/TO-CLARIFY.txt, "DMA-engine provider"
+ * drafted - see TO-CLARIFY.txt, "DMA-engine provider"
  * section, for the open question of whether this is the right way to
  * obtain it (phandle lookup) versus duplicating the "lsram" reg directly
  * onto the fpgadma node.
@@ -368,7 +368,7 @@ fpga_sampler_dma_prep_dma_cyclic(struct dma_chan *chan, dma_addr_t buf_addr,
  * bits before starting the transfer, because that register lives on the
  * *sampler* device's MMIO window, not on this DMA-controller device's
  * window, and this driver has no handle to it. See
- * mva-ext-dtso/TO-CLARIFY.txt, "DMA-engine provider" section, for the
+ * TO-CLARIFY.txt, "DMA-engine provider" section, for the
  * open question of how/whether readiness signalling should be plumbed
  * into this driver (e.g. via the SPI-offload trigger mechanism instead).
  *
@@ -466,7 +466,7 @@ static int fpga_sampler_dma_terminate_all(struct dma_chan *chan)
 	 * Mask further completion interrupts so the IRQ handler cannot race
 	 * with us starting another transfer after we drop dchan->desc below.
 	 * There is no separate documented hardware "abort in-flight
-	 * transfer" bit for this DMA IP (see mva-ext-dtso/TO-CLARIFY.txt,
+	 * transfer" bit for this DMA IP (see TO-CLARIFY.txt,
 	 * "DMA-engine provider" section), so masking interrupts and
 	 * dropping our descriptor reference is the best available stop
 	 * mechanism for now - a transfer already in flight in hardware will
@@ -593,7 +593,7 @@ static irqreturn_t fpga_sampler_dma_irq_handler(int irq, void *p)
  *
  * This phandle-based lookup (as opposed to duplicating the "lsram" reg
  * directly onto the DMA-controller node) is a design choice with open
- * questions - see mva-ext-dtso/TO-CLARIFY.txt, "DMA-engine provider"
+ * questions - see TO-CLARIFY.txt, "DMA-engine provider"
  * section.
  *
  * Return: 0 on success, negative errno on failure (missing property,
