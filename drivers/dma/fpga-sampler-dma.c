@@ -6,12 +6,17 @@
  * dma_sampler_irq_handler() there for the existing register-poking
  * implementation this driver is meant to replace).
  *
- * This file is a SKELETON only: function bodies contain the structural
- * dmaengine/virt-dma bookkeeping calls, but the actual FPGA register
- * accesses are left as TODO comments. It is meant as a starting point for
- * turning this custom descriptor-based DMA IP into a standard `dma_chan`
- * that other drivers (e.g. a future SPI-offload provider, or IIO's
- * industrialio-buffer-dmaengine.c) can request via dma_request_chan().
+ * This file implements the structural dmaengine/virt-dma bookkeeping plus
+ * the FPGA DMA_* register programming needed to actually run a cyclic
+ * ping-pong transfer (mirroring dma_sampler_start_transfer()/
+ * dma_sampler_irq_handler() from dma-sampler.c). It is UNTESTED (this
+ * environment cannot build/run kernel code - see repository notes) and
+ * still has open questions flagged as TODO/"see TO-CLARIFY.txt" comments,
+ * most notably around hardware readiness signalling and abort semantics.
+ * It is meant as a starting point for turning this custom descriptor-
+ * based DMA IP into a standard `dma_chan` that other drivers (e.g. a
+ * future SPI-offload provider, or IIO's industrialio-buffer-dmaengine.c)
+ * can request via dma_request_chan().
  *
  * Background for readers new to the dmaengine framework
  * -------------------------------------------------------
@@ -47,13 +52,73 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/of_dma.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/wordpart.h>
 
 #include "virt-dma.h"
 
-#define FPGA_SAMPLER_DMA_ADDRESS	0x60010000
-#define FPGA_SAMPLER_DMA_SIZE		0x1000
+/*
+ * Register map for the DMA_* registers, mirrored from
+ * drivers/iio/adc/dma-sampler.c (DMA_INTR_0_*, DMA_DESC_0_*,
+ * DMA_START_OPERATION_REG) - see that file's comment block for the
+ * authoritative description of this custom (non-virt-dma-hardware)
+ * descriptor-register block. The base address/size of this register
+ * window is NOT hard-coded here: it comes from this device's "reg"
+ * property (index 0) in device tree, matching mva-ext-dtso/
+ * iio-mem-access-overlay.dtso's `fpgadma` node.
+ */
+#define DMA_INTR_0_STAT_REG		0x010
+#define DMA_INTR_0_MASK_REG		0x014
+#define DMA_INTR_0_CLEAR_REG		0x018
+
+#define DMA_INTR_INVLD_BUFF_DESC	BIT(3)
+#define DMA_INTR_RD_TRAN		BIT(2)
+#define DMA_INTR_WR_TRAN		BIT(1)
+#define DMA_INTR_OPS_COMPL		BIT(0)
+#define DMA_INTR_CLEAR_ALL		(DMA_INTR_INVLD_BUFF_DESC |	\
+					 DMA_INTR_RD_TRAN |		\
+					 DMA_INTR_WR_TRAN |		\
+					 DMA_INTR_OPS_COMPL)
+
+#define DMA_DESC_0_CONFIG_REG		0x060
+#define DMA_DESC_0_BYTE_COUNT_REG	0x064
+#define DMA_DESC_0_SOURCE_ADDR_REG	0x068
+#define DMA_DESC_0_DEST_ADDR_REG	0x06c
+#define DMA_DESC_0_NEXT_DEST_ADDR_REG	0x070
+
+#define DMA_DESCRIPTOR_VALID		BIT(15)
+#define DMA_DEST_DATA_READY		BIT(14)
+#define DMA_SOURCE_DATA_VALID		BIT(13)
+#define DMA_INTR_ON_PROCESS		BIT(12)
+#define DMA_DESTINATION_OPR_01		BIT(2)
+#define DMA_SOURCE_OPR_01		BIT(0)
+
+#define DMA_DESC_0_CONFIG		(DMA_DESCRIPTOR_VALID |		\
+					 DMA_DEST_DATA_READY |		\
+					 DMA_SOURCE_DATA_VALID |	\
+					 DMA_INTR_ON_PROCESS |		\
+					 DMA_DESTINATION_OPR_01 |	\
+					 DMA_SOURCE_OPR_01)
+
+#define DMA_START_OPERATION_REG	0x004
+#define DMA_START_BIT_0			BIT(0)
+
+/*
+ * Devicetree phandle property used to locate the FPGA sampler's "lsram"
+ * reg window (the DMA source aperture, @ 0x80000000 today - see
+ * mva-ext-dtso/iio-mem-access-overlay.dtso's `fpgasampler` node). This is
+ * a NEW property, not present in the existing dtso as originally
+ * drafted - see mva-ext-dtso/TO-CLARIFY.txt, "DMA-engine provider"
+ * section, for the open question of whether this is the right way to
+ * obtain it (phandle lookup) versus duplicating the "lsram" reg directly
+ * onto the fpgadma node.
+ */
+#define FPGA_SAMPLER_DMA_OF_SAMPLER_PROP	"rohm,sampler"
+#define FPGA_SAMPLER_DMA_LSRAM_REG_NAME		"lsram"
 
 /*
  * struct fpga_sampler_dma_desc - one cyclic transfer request
@@ -101,18 +166,27 @@ struct fpga_sampler_dma_chan {
 
 /*
  * struct fpga_sampler_dma - per-device state
- * @dma_dev: the registered dmaengine device (one per platform_device).
- * @chan:    the single hardware channel exposed by this IP.
- * @regs:    ioremap()'d MMIO window for the DMA_* registers at
- *           0x60010000 (DMA_INTR_0_*, DMA_DESC_0_*, DMA_START_OPERATION_REG
- *           etc. - see drivers/iio/adc/dma-sampler.c for the existing
- *           register map this driver takes over).
- * @irq:     DMA completion interrupt (PLIC source 121 on BeagleV-Fire).
+ * @dma_dev:       the registered dmaengine device (one per platform_device).
+ * @chan:          the single hardware channel exposed by this IP.
+ * @regs:          ioremap()'d MMIO window for the DMA_* registers, obtained
+ *                 from this device's own "reg" property (index 0) rather
+ *                 than a hard-coded address.
+ * @lsram_addr:    DMA-bus address of the FPGA sampler's LSRAM aperture
+ *                 (the DMA source), obtained from the sampler node's
+ *                 "lsram" reg window via device tree - see
+ *                 fpga_sampler_dma_of_get_lsram().
+ * @lsram_size:    size of that LSRAM aperture, in bytes; used to validate
+ *                 that a requested cyclic transfer's period_len evenly
+ *                 divides it into the expected number of ping-pong halves.
+ * @irq:           DMA completion interrupt (PLIC source 121 on
+ *                 BeagleV-Fire).
  */
 struct fpga_sampler_dma {
 	struct dma_device dma_dev;
 	struct fpga_sampler_dma_chan chan;
 	void __iomem *regs;
+	dma_addr_t lsram_addr;
+	resource_size_t lsram_size;
 	int irq;
 };
 
@@ -170,10 +244,13 @@ static int fpga_sampler_dma_alloc_chan_resources(struct dma_chan *chan)
 {
 	struct fpga_sampler_dma *dmac = to_fpga_sampler_dma(chan);
 
-	/* TODO: clear/mask DMA_INTR_0_* registers via dmac->regs, mirroring
-	 * the "clear interrupts" block currently done in
-	 * dma_sampler_probe()/dma_sampler_start_transfer().
+	/* Clear and mask any interrupt state left over from a previous user
+	 * (e.g. a warm reboot, or the debug UIO path having run before this
+	 * driver was bound), mirroring the "clear interrupts" block in
+	 * dma_sampler_start_transfer()/dma_sampler_probe() today.
 	 */
+	iowrite32(DMA_INTR_CLEAR_ALL, dmac->regs + DMA_INTR_0_CLEAR_REG);
+	iowrite32(DMA_INTR_CLEAR_ALL, dmac->regs + DMA_INTR_0_MASK_REG);
 
 	return 0;
 }
@@ -190,11 +267,14 @@ static int fpga_sampler_dma_alloc_chan_resources(struct dma_chan *chan)
  */
 static void fpga_sampler_dma_free_chan_resources(struct dma_chan *chan)
 {
+	struct fpga_sampler_dma *dmac = to_fpga_sampler_dma(chan);
 	struct fpga_sampler_dma_chan *dchan = to_fpga_sampler_dma_chan(chan);
 
-	/* TODO: make sure the hardware DMA engine is stopped (defensive; the
-	 * core should have already called device_terminate_all()).
+	/* Defensively mask interrupts; the core is expected to have already
+	 * called device_terminate_all() before releasing the channel, so
+	 * this is a belt-and-braces stop, not the primary abort path.
 	 */
+	iowrite32(DMA_INTR_CLEAR_ALL, dmac->regs + DMA_INTR_0_MASK_REG);
 
 	vchan_free_chan_resources(&dchan->vc);
 }
@@ -232,16 +312,28 @@ fpga_sampler_dma_prep_dma_cyclic(struct dma_chan *chan, dma_addr_t buf_addr,
 				 enum dma_transfer_direction direction,
 				 unsigned long flags)
 {
+	struct fpga_sampler_dma *dmac = to_fpga_sampler_dma(chan);
 	struct fpga_sampler_dma_chan *dchan = to_fpga_sampler_dma_chan(chan);
 	struct fpga_sampler_dma_desc *desc;
 
 	if (direction != DMA_DEV_TO_MEM)
 		return NULL;
 
-	/* TODO: validate buf_len/period_len against hardware limits (e.g.
-	 * SAMPLER_BUFFER_BYTE_COUNT_HALF) and that buf_len is an integer
-	 * multiple of period_len (required for ping-pong operation).
+	/*
+	 * This hardware only ever moves whole LSRAM halves: buf_len must be
+	 * exactly two periods (ping + pong), and each period must exactly
+	 * match the LSRAM aperture size reported by device tree (see
+	 * fpga_sampler_dma_of_get_lsram()). Anything else means the
+	 * consumer's buffer geometry does not match what the FPGA sampler
+	 * gateware actually produces per half.
 	 */
+	if (!period_len || period_len != dmac->lsram_size ||
+	    buf_len != period_len * 2) {
+		dev_err(chan->device->dev,
+			"unsupported cyclic geometry: buf_len=%zu period_len=%zu (expected period_len=%pap, buf_len=2x)\n",
+			buf_len, period_len, &dmac->lsram_size);
+		return NULL;
+	}
 
 	desc = kzalloc(sizeof(*desc), GFP_NOWAIT);
 	if (!desc)
@@ -271,29 +363,41 @@ fpga_sampler_dma_prep_dma_cyclic(struct dma_chan *chan, dma_addr_t buf_addr,
  * keep the ping-pong stream going for as long as the descriptor remains
  * queued (i.e. until fpga_sampler_dma_terminate_all() is called).
  *
+ * NOTE: unlike dma_sampler_start_transfer() in dma-sampler.c, this
+ * function does NOT poll the sampler's SAMPLER_STATUS_REG "half ready"
+ * bits before starting the transfer, because that register lives on the
+ * *sampler* device's MMIO window, not on this DMA-controller device's
+ * window, and this driver has no handle to it. See
+ * mva-ext-dtso/TO-CLARIFY.txt, "DMA-engine provider" section, for the
+ * open question of how/whether readiness signalling should be plumbed
+ * into this driver (e.g. via the SPI-offload trigger mechanism instead).
+ *
  * Caller must hold dchan->vc.lock.
  */
 static void fpga_sampler_dma_start_transfer(struct fpga_sampler_dma *dmac,
 					    struct fpga_sampler_dma_chan *dchan)
 {
 	struct fpga_sampler_dma_desc *desc = dchan->desc;
-	dma_addr_t dst;
+	dma_addr_t src, dst;
 
 	if (!desc)
 		return;
 
+	src = dmac->lsram_addr + dchan->next_half * desc->period_len;
 	dst = desc->buf_addr + dchan->next_half * desc->period_len;
 
-	/* TODO: wait for/confirm the sampler side has a half-buffer ready
-	 * (equivalent of dma_sampler_buffer_is_ready() today - though with a
-	 * real dmaengine split, this readiness signalling more properly
-	 * belongs to the SPI-offload provider driver rather than here).
-	 *
-	 * TODO: iowrite32() the source address (LSRAM half offset), dst,
-	 * desc->period_len and DMA_DESC_0_CONFIG into dmac->regs, then
-	 * iowrite32(DMA_START_BIT_0, ...DMA_START_OPERATION_REG) to kick off
-	 * the transfer - mirroring dma_sampler_start_transfer().
-	 */
+	/* clear interrupts */
+	iowrite32(DMA_INTR_CLEAR_ALL, dmac->regs + DMA_INTR_0_CLEAR_REG);
+	iowrite32(DMA_INTR_CLEAR_ALL, dmac->regs + DMA_INTR_0_MASK_REG);
+
+	/* setup and start transfer */
+	iowrite32(lower_32_bits(src), dmac->regs + DMA_DESC_0_SOURCE_ADDR_REG);
+	iowrite32(lower_32_bits(dst), dmac->regs + DMA_DESC_0_DEST_ADDR_REG);
+	iowrite32(desc->period_len, dmac->regs + DMA_DESC_0_BYTE_COUNT_REG);
+	iowrite32(DMA_DESC_0_CONFIG, dmac->regs + DMA_DESC_0_CONFIG_REG);
+	mmiowb();
+
+	iowrite32(DMA_START_BIT_0, dmac->regs + DMA_START_OPERATION_REG);
 
 	dchan->next_half = !dchan->next_half;
 }
@@ -358,10 +462,18 @@ static int fpga_sampler_dma_terminate_all(struct dma_chan *chan)
 
 	spin_lock_irqsave(&dchan->vc.lock, flags);
 
-	/* TODO: mask DMA_INTR_0_* and/or otherwise stop the hardware from
-	 * starting/continuing any transfer, mirroring what
-	 * dma_sampler_iio_dma_buffer_abort() does today.
+	/*
+	 * Mask further completion interrupts so the IRQ handler cannot race
+	 * with us starting another transfer after we drop dchan->desc below.
+	 * There is no separate documented hardware "abort in-flight
+	 * transfer" bit for this DMA IP (see mva-ext-dtso/TO-CLARIFY.txt,
+	 * "DMA-engine provider" section), so masking interrupts and
+	 * dropping our descriptor reference is the best available stop
+	 * mechanism for now - a transfer already in flight in hardware will
+	 * still run to completion, but its completion interrupt will be
+	 * ignored since DMA_INTR_0_MASK_REG is set and dchan->desc is NULL.
 	 */
+	iowrite32(DMA_INTR_CLEAR_ALL, dmac->regs + DMA_INTR_0_MASK_REG);
 
 	dchan->desc = NULL;
 	vchan_get_all_descriptors(&dchan->vc, &head);
@@ -446,7 +558,8 @@ static irqreturn_t fpga_sampler_dma_irq_handler(int irq, void *p)
 	struct fpga_sampler_dma *dmac = p;
 	struct fpga_sampler_dma_chan *dchan = &dmac->chan;
 
-	/* TODO: clear/ack DMA_INTR_0_* registers via dmac->regs. */
+	/* clear interrupts */
+	iowrite32(DMA_INTR_CLEAR_ALL, dmac->regs + DMA_INTR_0_CLEAR_REG);
 
 	spin_lock(&dchan->vc.lock);
 
@@ -458,6 +571,72 @@ static irqreturn_t fpga_sampler_dma_irq_handler(int irq, void *p)
 	spin_unlock(&dchan->vc.lock);
 
 	return IRQ_HANDLED;
+}
+
+/**
+ * fpga_sampler_dma_of_get_lsram() - resolve the FPGA sampler's LSRAM window
+ * @dmac: device state to fill in (lsram_addr/lsram_size)
+ * @dev:  this DMA-controller device (its of_node must have a
+ *        "rohm,sampler" phandle property pointing at the sampler node)
+ *
+ * The LSRAM aperture (the DMA source region the sampler gateware writes
+ * ADC samples into) is a property of the *sampler* device's devicetree
+ * node, not this DMA-controller node - see
+ * mva-ext-dtso/iio-mem-access-overlay.dtso's `fpgasampler` node, which
+ * lists it as its second, named "lsram" reg window. This helper follows
+ * the "rohm,sampler" phandle from our own node to that sampler node,
+ * finds the "lsram"-named reg entry within it via "reg-names", and
+ * resolves it to a physical address/size with of_address_to_resource() -
+ * without ioremap()'ing it ourselves, since the sampler driver (not this
+ * DMA driver) owns that MMIO region and maps it for its own accesses to
+ * SPI_RATE_SEL/SPI_TX_WORD/etc.
+ *
+ * This phandle-based lookup (as opposed to duplicating the "lsram" reg
+ * directly onto the DMA-controller node) is a design choice with open
+ * questions - see mva-ext-dtso/TO-CLARIFY.txt, "DMA-engine provider"
+ * section.
+ *
+ * Return: 0 on success, negative errno on failure (missing property,
+ * missing "lsram" reg-names entry, or unresolvable address).
+ */
+static int fpga_sampler_dma_of_get_lsram(struct fpga_sampler_dma *dmac,
+					 struct device *dev)
+{
+	struct device_node *sampler_np;
+	struct resource res;
+	int index;
+	int ret;
+
+	sampler_np = of_parse_phandle(dev->of_node,
+				      FPGA_SAMPLER_DMA_OF_SAMPLER_PROP, 0);
+	if (!sampler_np)
+		return dev_err_probe(dev, -ENODEV,
+				     "missing \"%s\" phandle to FPGA sampler node\n",
+				     FPGA_SAMPLER_DMA_OF_SAMPLER_PROP);
+
+	index = of_property_match_string(sampler_np, "reg-names",
+					 FPGA_SAMPLER_DMA_LSRAM_REG_NAME);
+	if (index < 0) {
+		ret = dev_err_probe(dev, index,
+				    "sampler node has no \"%s\" reg-names entry\n",
+				    FPGA_SAMPLER_DMA_LSRAM_REG_NAME);
+		goto out_put;
+	}
+
+	ret = of_address_to_resource(sampler_np, index, &res);
+	if (ret) {
+		ret = dev_err_probe(dev, ret,
+				    "failed to resolve \"%s\" reg from sampler node\n",
+				    FPGA_SAMPLER_DMA_LSRAM_REG_NAME);
+		goto out_put;
+	}
+
+	dmac->lsram_addr = res.start;
+	dmac->lsram_size = resource_size(&res);
+
+out_put:
+	of_node_put(sampler_np);
+	return ret;
 }
 
 static int fpga_sampler_dma_probe(struct platform_device *pdev)
@@ -473,11 +652,19 @@ static int fpga_sampler_dma_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, dmac);
 
-	dmac->regs = devm_ioremap(dev, FPGA_SAMPLER_DMA_ADDRESS,
-				  FPGA_SAMPLER_DMA_SIZE);
-	if (!dmac->regs)
-		return dev_err_probe(dev, -EINVAL,
+	/* DMA_* register window: address/size come from this device's own
+	 * "reg" property (index 0) in device tree, not a hard-coded
+	 * address - see mva-ext-dtso/iio-mem-access-overlay.dtso's
+	 * `fpgadma` node.
+	 */
+	dmac->regs = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(dmac->regs))
+		return dev_err_probe(dev, PTR_ERR(dmac->regs),
 				     "failed to map dma registers\n");
+
+	ret = fpga_sampler_dma_of_get_lsram(dmac, dev);
+	if (ret)
+		return ret;
 
 	dmac->irq = platform_get_irq(pdev, 0);
 	if (dmac->irq < 0)
@@ -516,13 +703,22 @@ static int fpga_sampler_dma_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret,
 				     "failed to register dma device\n");
 
-	/* TODO: register this device as a DMA controller for devicetree
-	 * lookups, e.g. via of_dma_controller_register(), so that consumers
-	 * can request our channel by name through the standard "dmas"/
-	 * "dma-names" devicetree properties (see how spi-axi-spi-engine.c's
-	 * offload glue requests its "offloadN-rx" channel for the pattern
-	 * this driver's channel is meant to support).
+	/*
+	 * Register ourselves as a DMA controller for devicetree lookups, so
+	 * consumers can request our single channel by name (e.g.
+	 * dma_request_chan(dev, "rx")) via the standard "dmas"/"dma-names"
+	 * properties - see mva-ext-dtso/iio-mem-access-overlay.dtso's
+	 * `fpgasampler` node ("dmas = <&fpgadma>;"). of_dma_simple_xlate()
+	 * is sufficient here since we have exactly one channel and
+	 * "#dma-cells = <0>" (no per-request parameters to decode).
 	 */
+	ret = of_dma_controller_register(dev->of_node, of_dma_simple_xlate,
+					 &dmac->chan.vc.chan);
+	if (ret) {
+		dma_async_device_unregister(dma_dev);
+		return dev_err_probe(dev, ret,
+				     "failed to register of_dma controller\n");
+	}
 
 	return 0;
 }
@@ -531,8 +727,7 @@ static void fpga_sampler_dma_remove(struct platform_device *pdev)
 {
 	struct fpga_sampler_dma *dmac = platform_get_drvdata(pdev);
 
-	/* TODO: of_dma_controller_free() counterpart, if registered above. */
-
+	of_dma_controller_free(pdev->dev.of_node);
 	dma_async_device_unregister(&dmac->dma_dev);
 }
 
