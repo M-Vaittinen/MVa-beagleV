@@ -31,6 +31,9 @@ obj-$(CONFIG_DW_AXI_DMAC) += dw-axi-dmac/
 obj-$(CONFIG_DW_DMAC_CORE) += dw/
 obj-$(CONFIG_DW_EDMA) += dw-edma/
 obj-$(CONFIG_EP93XX_DMA) += ep93xx_dma.o
+# unconditionally enabled for now (no Kconfig option yet) - see
+# TO-CLARIFY.txt, "DMA-engine provider" section
+obj-y += fpga-sampler-dma.o
 fsl-edma-trace-$(CONFIG_TRACING) := fsl-edma-trace.o
 CFLAGS_fsl-edma-trace.o := -I$(src)
 obj-$(CONFIG_FSL_DMA) += fsldma.o
