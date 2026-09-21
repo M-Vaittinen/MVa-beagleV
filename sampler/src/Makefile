@@ -15,12 +15,21 @@ VIEW_BIN = adc_capture_view
 VIEW_SRC = adc_capture_view.c
 VIEW_OBJ = adc_capture_view.o
 
+# adc_direct_capture: libIIO-free equivalent of adc_capture, talking to
+# the kernel's IIO sysfs ABI and /dev/iio:deviceN directly. Intended to
+# run only on the BeagleV-Fire target itself; deliberately has NO -liio
+# dependency (only libc), unlike adc_capture.
+DIRECT_BIN = adc_direct_capture
+DIRECT_SRC = adc_direct_capture.c
+DIRECT_OBJ = adc_direct_capture.o
+
 CFLAGS = -g -O3 -Wall -fPIC
 LDFLAGS = -shared -flto -liio
 BIN_LDFLAGS = -liio
 VIEW_LDFLAGS = -lncurses
+DIRECT_LDFLAGS =
 
-all: $(LIB) $(BIN) $(VIEW_BIN)
+all: $(LIB) $(BIN) $(VIEW_BIN) $(DIRECT_BIN)
 
 $(LIB): $(LIB_OBJ)
 	$(CC) $(LDFLAGS) -o $@ -Wl,-soname,$@ $^
@@ -40,7 +49,13 @@ $(VIEW_BIN): $(VIEW_OBJ)
 $(VIEW_OBJ): $(VIEW_SRC) capture_format.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+$(DIRECT_BIN): $(DIRECT_OBJ)
+	$(CC) -o $@ $^ $(DIRECT_LDFLAGS)
+
+$(DIRECT_OBJ): $(DIRECT_SRC) capture_format.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 .PHONY: clean
 clean:
-	rm -f $(LIB_OBJ) $(BIN_OBJ) $(VIEW_OBJ) $(LIB) $(BIN) $(VIEW_BIN)
+	rm -f $(LIB_OBJ) $(BIN_OBJ) $(VIEW_OBJ) $(DIRECT_OBJ) $(LIB) $(BIN) $(VIEW_BIN) $(DIRECT_BIN)
 
