@@ -53,33 +53,34 @@ following before using this overlay for real hardware bring-up:
    firmware/HSS before Linux boots) - please confirm this assumption
    holds, or supply the correct clock/reset bindings if not.
 
-4. `reg-names`/multi-window binding for the sampler node
+4. [RESOLVED] `reg-names`/multi-window binding for the sampler node
    -------------------------------------------------------
-   Splitting the sampler's `reg` into two named windows ("ctrl" +
-   "lsram") is a binding *I introduced* to match how dma-sampler.c
-   internally treats SAMPLER_ADDRESS and DMA_SOURCE_ADDRESS as separate
-   apertures of the same logical block. There is no existing precedent
-   for this in the repo (mem-access-overlay.dtso only lists the ctrl
-   window for the sampler, since UIO never accessed LSRAM directly via
-   mmap in the sampler node - the DMA controller did the addressing
-   instead). This binding is a NEW proposal and has not been reviewed
-   against any actual bindings documentation/schema (no
-   Documentation/devicetree/bindings/iio/adc/rohm,fpga-adc-sampler.yaml
-   exists yet - would need to be authored before upstreaming, but is
-   fine for local/out-of-tree use in the meantime).
+   An earlier revision of this overlay split the sampler's `reg` into
+   two named windows ("ctrl" + "lsram"), a binding introduced to match
+   how dma-sampler.c internally treats SAMPLER_ADDRESS and
+   DMA_SOURCE_ADDRESS as separate apertures of the same logical block.
+   This has since been resolved by item 7 below: LSRAM is now described
+   by its own standalone devicetree node (not a second reg window on the
+   sampler node at all), so the sampler node's `reg` is back to a single,
+   unnamed window (just "ctrl") and `reg-names` has been dropped
+   entirely. See item 7 and item 5 (now also resolved) for the final
+   design.
 
-5. Whether the "lsram" reg window should live on the sampler node at all
+5. [RESOLVED] Whether the "lsram" reg window should live on the sampler
+   node at all
    -----------------------------------------------------------------------
-   An alternative design would keep LSRAM addressing entirely internal
-   to the DMA-engine provider node (fpgadma) instead of the sampler node,
-   since it's the DMA controller, not the sampler, that actually reads
-   LSRAM as a DMA source. I put it on the sampler node because
-   dma-sampler.c's `st->half`/ping-pong bookkeeping today lives in the
-   IIO driver, which is the natural place to compute the correct LSRAM
-   half-offset before calling into the DMA API - but this is a design
-   choice, not a hard requirement, and should be revisited once the
-   actual SPI-offload consumer/provider split is implemented (see
-   TODO-spi-offload.txt step 3).
+   Resolved as part of item 7 below: LSRAM is described by its own
+   standalone node (no "compatible", reg-only), referenced directly by
+   the DMA-engine provider node (fpgadma) via a new "rohm,lsram" phandle
+   property - NOT by the sampler node at all. This is a cleaner
+   resolution than either original alternative (keeping it on the
+   sampler node, or duplicating it directly onto fpgadma as a second reg
+   window): it correctly models LSRAM as its own hardware entity (not
+   owned by either the sampler or the DMA controller), is referenced by
+   whichever driver actually needs it (today, only
+   drivers/dma/fpga-sampler-dma.c), and sidesteps the fabric-bus
+   "ranges" gap (see item 7) without forcing the sampler node itself out
+   of fabric-bus@40000000.
 
 6. reg/interrupt numbers themselves (0x60000000/0x60010000/0x80000000,
    IRQ 121/122)
@@ -89,9 +90,116 @@ following before using this overlay for real hardware bring-up:
    in use, but were not independently re-derived/verified against a
    gateware build artifact in this pass.
 
+7. [RESOLVED] fabric-bus@40000000 "ranges" does not cover the LSRAM
+   aperture (0x80000000) - LSRAM split into its own standalone node
+   -----------------------------------------------------------------
+   Symptom reported after first real hardware test: dma-sampler-dmaengine
+   probed (once its "compatible" was corrected to match fpgasampler's
+   "rohm,fpga-adc-sampler"), but then stayed stuck with
+   "platform 60000000.sampler: deferred probe pending: sampler-dmaengine:
+   failed to request dma channel" forever, and no /sys/bus/iio/devices/
+   entry ever appeared.
+
+   Root cause: the overlay originally nested fpgadma/fpgasampler as
+   children of "fabric-bus@40000000" (mirroring mem-access-overlay.dtso's
+   UIO nodes), with LSRAM described as a second, named "lsram" reg
+   window on the sampler node. That bus's "ranges" property - defined
+   identically in ALL FOUR board .dtsi variants checked
+   (mpfs-beaglev-fire-fabric.dtsi, mpfs-disco-kit-fabric.dtsi,
+   mpfs-icicle-kit-fabric.dtsi, mpfs-video-kit-fabric.dtsi) - is:
+
+       ranges = <0x0 0x40000000 0x0 0x40000000 0x0 0x20000000>, /* FIC3-FAB */
+                <0x0 0x60000000 0x0 0x60000000 0x0 0x20000000>, /* FIC0, LO */
+                <0x0 0xe0000000 0x0 0xe0000000 0x0 0x20000000>, /* FIC1, LO */
+                <0x20 0x0 0x20 0x0 0x10 0x0>, /* FIC0,HI */
+                <0x30 0x0 0x30 0x0 0x10 0x0>; /* FIC1,HI */
+
+   The "FIC0, LO" window is exactly 0x60000000 + 0x20000000 =
+   0x80000000 wide, i.e. it covers [0x60000000, 0x7fffffff] INCLUSIVE
+   and stops ONE BYTE before the LSRAM window's start address
+   (0x80000000). The "lsram" reg entry on fpgasampler
+   (<0x0 0x80000000 0x0 0x24000>) therefore had NO matching "ranges"
+   entry to translate through. fpga_sampler_dma_of_get_lsram()'s call
+   to of_address_to_resource() on that reg entry failed as a result
+   (translation error, not a transient/deferred condition), which made
+   fpga_sampler_dma_probe() return a hard error and RETURN WITHOUT EVER
+   CALLING of_dma_controller_register(). Since the DMA provider's
+   of_dma controller was consequently never registered for fpgadma's
+   of_node, dma-sampler-dmaengine's dma_request_chan(dev, "rx") kept
+   getting -EPROBE_DEFER indefinitely (the provider node exists and is
+   "okay", but of_dma_find_controller() never finds a matching
+   registration for it) - matching the exact symptom reported.
+
+   Fix applied (final): LSRAM is now described by its own small,
+   standalone devicetree node - "lsram: lsram@80000000 { reg = <0x0
+   0x80000000 0x0 0x24000>; };" - placed as a DIRECT child of the root
+   node ("&{/}"), NOT nested inside fabric-bus@40000000. It has no
+   "compatible" property, so of_platform_populate() never turns it into
+   a platform_device (strict mode skips compatible-less nodes) - it
+   exists purely as a devicetree-level resource locator. At the root,
+   its `reg` is a raw CPU-physical address with NO bus translation step
+   at all, so of_address_to_resource() now succeeds unconditionally,
+   matching what dma-sampler.c's existing devm_ioremap(0x80000000, ...)
+   call already implicitly assumed (a direct 1:1 physical mapping, no
+   translation). fpgadma (the DMA-engine provider node) references it
+   directly via a new "rohm,lsram = <&lsram>;" phandle property (see
+   DMA-engine provider section item 3, also updated).
+
+   Crucially, splitting out ONLY the LSRAM node (rather than moving the
+   whole fpgadma/fpgasampler pair to root, as a prior revision of this
+   fix did) lets fpgadma and fpgasampler go back to being children of
+   fabric-bus@40000000, which is where they topologically belong - they
+   are genuine FPGA-fabric IP blocks reachable through the exact same
+   FIC0 decode window as any other fabric-bus sibling (e.g.
+   cape_gpios_p8/p9, hsi_gpios), and their own remaining reg windows
+   (0x60000000/0x60010000) translate through fabric-bus's "ranges" just
+   fine - it was only the LSRAM address specifically that fell outside
+   the declared ranges. The codebase also does not strictly enforce
+   "fabric IP must be nested under fabric-bus" even when it would
+   translate correctly (e.g. mailbox@50000000 in
+   mpfs-beaglev-fire-fabric.dtsi sits directly under root despite its
+   address falling inside fabric-bus's declared ranges), so placing just
+   the LSRAM node at root is consistent with existing conventions, not a
+   novel exception.
+
+   Alternatives considered but NOT applied (recorded in case this
+   decision needs revisiting):
+     a) Extend fabric-bus@40000000's "ranges" (via a separate
+        "&{/fabric-bus@40000000} { ranges = <...>; };" overlay
+        fragment, since dtc overlays replace a targeted property
+        wholesale - the full existing list would need repeating plus a
+        new <0x0 0x80000000 0x0 0x80000000 0x0 0x20000000> entry) to
+        explicitly cover the LSRAM window. Not applied because it
+        requires asserting a specific physical/SoC-FIC-decode-window
+        fact (that 0x80000000 really is part of an existing FIC0
+        non-cached alias window, as opposed to some other, unrelated
+        address range that only numerically happens to equal
+        0x80000000) that could not be independently verified against
+        an authoritative Microchip PolarFire SoC memory map document in
+        this pass - please confirm with the FPGA/hardware team if this
+        approach is preferred over the standalone-node restructuring
+        actually applied.
+     b) Keep LSRAM addressing on the sampler node (or fpgadma), but have
+        fpga_sampler_dma_of_get_lsram() read the LSRAM address/size via
+        plain (non-"reg") vendor properties (e.g.
+        "rohm,lsram-addr"/"rohm,lsram-size" parsed with
+        of_property_read_u64()) instead of "reg", since plain integer
+        properties are never translated through bus "ranges". Not
+        applied because it would depart further from standard "reg"
+        devicetree conventions than necessary, when a standalone node
+        (which keeps the idiomatic `reg`-based address description,
+        just placed where it translates correctly) achieves the same
+        correctness with less novelty.
+     c) Move the whole fpgadma/fpgasampler pair to root (the first fix
+        attempted). Superseded by the current, more surgical fix: only
+        LSRAM - the actual node whose address falls outside
+        fabric-bus's ranges - needs to live at root; fpgadma/fpgasampler
+        have no such problem and are better left as fabric-bus children,
+        matching their real topology.
+
 None of the above block using this overlay for early bring-up/experiments
 (the values used are the best available from existing sources), but they
-should be confirmed - especially items 1-2 - before relying on this
+should be confirmed - especially items 1-2 and 7 - before relying on this
 overlay for anything beyond initial driver development.
 
 ===============================================================================
@@ -139,21 +247,28 @@ design decisions / assumptions that need confirmation:
    reset" register/bit, please point it out so terminate_all() can use
    it for a cleaner, faster abort.
 
-3. `rohm,sampler` phandle property (new, driver-specific)
+3. [RESOLVED] `rohm,lsram` phandle property (new, driver-specific)
    -----------------------------------------------------------------
-   Added a custom devicetree property (not part of any generic/upstream
-   binding) on the `fpgadma` node, `rohm,sampler = <&fpgasampler>;`, so
-   fpga_sampler_dma_of_get_lsram() can find the sampler node and read its
-   "lsram"-named reg entry. This creates a cross-reference in the
-   opposite direction of the normal `dmas`/`dma-names` consumer->provider
-   link (sampler node references the DMA node via `dmas`, and now the
-   DMA node also references the sampler node back via `rohm,sampler`).
-   This works but is unusual; an alternative would be to instead
-   duplicate the LSRAM reg/size directly onto the `fpgadma` node itself
-   (avoiding the back-reference, at the cost of listing the same address
-   in two places in the devicetree). Please confirm which approach is
-   preferred, especially if this binding is ever meant to be upstreamed
-   or formally documented.
+   An earlier revision added a custom devicetree property on `fpgadma`,
+   `rohm,sampler = <&fpgasampler>;`, so fpga_sampler_dma_of_get_lsram()
+   could find the sampler node and read its "lsram"-named reg entry.
+   This created an unusual cross-reference in the opposite direction of
+   the normal `dmas`/`dma-names` consumer->provider link.
+
+   Resolved together with device-tree section item 7: LSRAM is now its
+   own standalone devicetree node (no "compatible", reg-only), and
+   `fpgadma` references it directly via a new `rohm,lsram = <&lsram>;`
+   phandle property instead. This is still a custom, driver-specific
+   property (not part of any generic/upstream dmaengine binding), but
+   it no longer back-references the sampler node at all - `fpgadma` now
+   points at a small, independent resource descriptor that describes
+   exactly the one thing this DMA driver actually needs (the LSRAM
+   aperture), rather than reaching into a sibling consumer device's
+   node. This is a materially more conventional shape for a phandle
+   property. No further action needed unless this binding is ever
+   upstreamed/formally documented (would still need a
+   Documentation/devicetree/bindings/dma/rohm,fpga-sampler-dma.yaml
+   schema, as before).
 
 4. `#dma-cells = <0>` and of_dma_simple_xlate() assumption
    -----------------------------------------------------------------
