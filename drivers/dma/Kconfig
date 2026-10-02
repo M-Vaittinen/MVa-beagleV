@@ -233,6 +233,21 @@ config FSL_QDMA
 	 This module can be found on NXP Layerscape SoCs.
 	  The qdma driver only work on  SoCs with a DPAA hardware block.
 
+config FPGA_SAMPLER_DMA
+	tristate "ROHM BeagleV-Fire FPGA ADC sampler DMA controller support"
+	depends on OF
+	depends on HAS_IOMEM
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	help
+	  Support for the FPGA-fabric DMA controller used by the ROHM ADC
+	  sampler PoC hardware on the BeagleV-Fire board. It performs
+	  cyclic copies of ADC samples from the FPGA's LSRAM ping-pong
+	  buffer into DDR, and registers a dmaengine channel consumed by
+	  the "sampler-dmaengine" IIO driver (DMA_SAMPLER_DMAENGINE).
+
+	  If unsure, say N.
+
 config FSL_RAID
 	tristate "Freescale RAID engine Support"
 	depends on FSL_SOC && !ASYNC_TX_ENABLE_CHANNEL_SWITCH
