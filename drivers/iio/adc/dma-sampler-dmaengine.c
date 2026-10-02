@@ -60,10 +60,14 @@
  * sampler bits and registers (identical to dma-sampler.c; the ADC/SPI
  * sampler control side of things is unchanged by this driver - only the
  * DMA transfer mechanism differs).
+ *
+ * NOTE: the sampler's MMIO window address/size are no longer hard-coded
+ * here - they are now obtained from this platform device's "reg"
+ * property (devm_platform_ioremap_resource(pdev, 0) in probe()),
+ * matching mva-ext-dtso/iio-mem-access-overlay.dtso's `fpgasampler`
+ * node (a single, unnamed "ctrl" window - see TO-CLARIFY.txt, device
+ * tree section item 4).
  */
-#define SAMPLER_ADDRESS			0x60000000
-#define SAMPLER_SIZE			0x1000
-
 #define SAMPLER_LSRAM_WORD_COUNT	18432
 #define SAMPLER_SAMPLES_PER_LSRAM_WORD	4
 #define SAMPLER_LSRAM_SAMPLE_COUNT	(SAMPLER_LSRAM_WORD_COUNT *	\
@@ -468,9 +472,14 @@ static int fpga_sampler_dmaengine_probe(struct platform_device *pdev)
 	indio_dev->num_channels = ARRAY_SIZE(dma_sampler_channels);
 	indio_dev->available_scan_masks = dma_sampler_available_scan_masks;
 
-	st->sampler_regs = devm_ioremap(dev, SAMPLER_ADDRESS, SAMPLER_SIZE);
-	if (!st->sampler_regs)
-		return dev_err_probe(dev, -EINVAL,
+	/*
+	 * Sampler ctrl register window, obtained from this node's "reg"
+	 * property (index 0 - the only entry, now that "lsram" has been
+	 * split out)
+	 */
+	st->sampler_regs = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(st->sampler_regs))
+		return dev_err_probe(dev, PTR_ERR(st->sampler_regs),
 				     "failed to map sampler registers\n");
 
 	/*
