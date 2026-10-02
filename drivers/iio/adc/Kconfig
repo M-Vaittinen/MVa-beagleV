@@ -522,6 +522,21 @@ config DLN2_ADC
 	  This driver can also be built as a module. If so, the module will be
 	  called adc_dln2.
 
+config DMA_SAMPLER_DMAENGINE
+	tristate "ROHM BeagleV-Fire FPGA ADC sampler (dmaengine) driver"
+	depends on OF
+	depends on FPGA_SAMPLER_DMA
+	select IIO_BUFFER
+	select IIO_KFIFO_BUF
+	help
+	  IIO driver for the ROHM ADC sampler PoC hardware on the
+	  BeagleV-Fire board. Uses the generic dmaengine API (via the
+	  FPGA_SAMPLER_DMA provider) to copy ADC samples out of the
+	  FPGA's LSRAM into a kfifo-backed IIO buffer, instead of
+	  directly accessing the FPGA's DMA registers
+
+	  If unsure, say N.
+
 config ENVELOPE_DETECTOR
 	tristate "Envelope detector using a DAC and a comparator"
 	help
