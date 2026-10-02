@@ -525,7 +525,7 @@ static int fpga_sampler_dmaengine_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id dma_sampler_dmaengine_of_match[] = {
-	{ .compatible = "rohm,sampler-dmaengine" },
+	{ .compatible = "rohm,fpga-adc-sampler" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, dma_sampler_dmaengine_of_match);
