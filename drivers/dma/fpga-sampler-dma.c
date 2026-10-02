@@ -310,18 +310,24 @@ fpga_sampler_dma_prep_dma_cyclic(struct dma_chan *chan, dma_addr_t buf_addr,
 		return NULL;
 
 	/*
-	 * This hardware only ever moves whole LSRAM halves: buf_len must be
-	 * exactly two periods (ping + pong), and each period must exactly
-	 * match the LSRAM aperture size reported by device tree (see
-	 * fpga_sampler_dma_of_get_lsram()). Anything else means the
-	 * consumer's buffer geometry does not match what the FPGA sampler
-	 * gateware actually produces per half.
+	 * This hardware only ever moves one LSRAM half at a time: each
+	 * period must exactly match one half of the LSRAM aperture reported
+	 * by device tree (see fpga_sampler_dma_of_get_lsram()), and buf_len
+	 * must be exactly two periods (ping + pong) - i.e. buf_len must
+	 * equal the full LSRAM aperture size. This mirrors dma-sampler.c's
+	 * existing (hand-rolled) transfer geometry: it always programs
+	 * DMA_DESC_0_BYTE_COUNT_REG with SAMPLER_BUFFER_BYTE_COUNT_HALF
+	 * (half the LSRAM aperture) per transfer, alternating
+	 * DMA_SOURCE_ADDRESS + half * SAMPLER_BUFFER_BYTE_COUNT_HALF as the
+	 * source address
 	 */
-	if (!period_len || period_len != dmac->lsram_size ||
+	if (!period_len || period_len != dmac->lsram_size / 2 ||
 	    buf_len != period_len * 2) {
+		resource_size_t expected_period_len = dmac->lsram_size / 2;
+
 		dev_err(chan->device->dev,
 			"unsupported cyclic geometry: buf_len=%zu period_len=%zu (expected period_len=%pap, buf_len=2x)\n",
-			buf_len, period_len, &dmac->lsram_size);
+			buf_len, period_len, &expected_period_len);
 		return NULL;
 	}
 
