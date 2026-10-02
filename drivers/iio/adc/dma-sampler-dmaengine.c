@@ -4,18 +4,7 @@
  * generic Linux dmaengine API (against drivers/dma/fpga-sampler-dma.c)
  * instead of directly poking the FPGA DMA_* registers.
  *
- * This file is a DELIBERATE PARALLEL/ALTERNATIVE to dma-sampler.c, not a
- * replacement. dma-sampler.c drives the FPGA DMA controller registers
- * directly from within the IIO driver (custom iio_dma_buffer_ops::submit
- * calling dma_sampler_start_transfer() itself). This driver instead
- * requests a channel from the fpga-sampler-dma dmaengine provider via
- * dma_request_chan() and lets that separate driver own the DMA_* register
- * pokes, so the two concerns (ADC/SPI-sampler control vs. DMA transfer
- * mechanics) are split across two drivers as they would be for a "normal"
- * IIO ADC. See TODO-dmaengine-only-plan.txt for the design rationale and
- * pros/cons discussion, and TO-CLARIFY.txt for open items.
- *
- * IMPORTANT design note - why this driver does NOT use the generic
+ * Why this driver does NOT use the generic
  * drivers/iio/buffer/industrialio-buffer-dmaengine.c helper:
  *
  * That helper (devm_iio_dmaengine_buffer_setup_with_handle() and friends)
