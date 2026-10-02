@@ -612,6 +612,34 @@ out_put:
 	return ret;
 }
 
+/**
+ * fpga_sampler_dma_of_xlate() - of_dma_controller_register() xlate callback
+ * @dma_spec: devicetree DMA specifier (from the consumer's "dmas"
+ *            property) - args_count must be 0, matching our
+ *            "#dma-cells = <0>" (single, fixed-function channel, no
+ *            per-request parameters to decode).
+ * @ofdma:    DMA controller registration data; ofdma->of_dma_data is the
+ *            `struct dma_chan *` we passed to of_dma_controller_register()
+ *            below (our one and only vchan channel).
+ *
+ * NOTE: of_dma_simple_xlate() (the generic helper used by many other
+ * dmaengine providers) is NOT appropriate here. it requires
+ * "#dma-cells = <1>"
+ *
+ * Return: our channel (with its use-count bumped) on success, or NULL
+ * if the specifier doesn't match our "#dma-cells = <0>" binding.
+ */
+static struct dma_chan *fpga_sampler_dma_of_xlate(struct of_phandle_args *dma_spec,
+						  struct of_dma *ofdma)
+{
+	struct dma_chan *chan = ofdma->of_dma_data;
+
+	if (dma_spec->args_count != 0)
+		return NULL;
+
+	return dma_get_slave_channel(chan);
+}
+
 static int fpga_sampler_dma_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -680,12 +708,9 @@ static int fpga_sampler_dma_probe(struct platform_device *pdev)
 	 * Register ourselves as a DMA controller for devicetree lookups, so
 	 * consumers can request our single channel by name (e.g.
 	 * dma_request_chan(dev, "rx")) via the standard "dmas"/"dma-names"
-	 * properties - see mva-ext-dtso/iio-mem-access-overlay.dtso's
-	 * `fpgasampler` node ("dmas = <&fpgadma>;"). of_dma_simple_xlate()
-	 * is sufficient here since we have exactly one channel and
-	 * "#dma-cells = <0>" (no per-request parameters to decode).
+	 * properties
 	 */
-	ret = of_dma_controller_register(dev->of_node, of_dma_simple_xlate,
+	ret = of_dma_controller_register(dev->of_node, fpga_sampler_dma_of_xlate,
 					 &dmac->chan.vc.chan);
 	if (ret) {
 		dma_async_device_unregister(dma_dev);
