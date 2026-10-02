@@ -108,17 +108,14 @@
 #define DMA_START_BIT_0			BIT(0)
 
 /*
- * Devicetree phandle property used to locate the FPGA sampler's "lsram"
- * reg window (the DMA source aperture, @ 0x80000000 today - see
- * mva-ext-dtso/iio-mem-access-overlay.dtso's `fpgasampler` node). This is
- * a NEW property, not present in the existing dtso as originally
- * drafted - see TO-CLARIFY.txt, "DMA-engine provider"
- * section, for the open question of whether this is the right way to
- * obtain it (phandle lookup) versus duplicating the "lsram" reg directly
- * onto the fpgadma node.
+ * Devicetree phandle property used to locate the FPGA's LSRAM aperture
+ * (the DMA source region, @ 0x80000000 today).
+ * We couldn't have the lsram address in the sampler node, because the
+ * LSRAM aperture's address (0x80000000) falls outside every "ranges"
+ * window declared on the shared "fabric-bus@40000000" node that
+ * fpgadma/fpgasampler otherwise live under
  */
-#define FPGA_SAMPLER_DMA_OF_SAMPLER_PROP	"rohm,sampler"
-#define FPGA_SAMPLER_DMA_LSRAM_REG_NAME		"lsram"
+#define FPGA_SAMPLER_DMA_OF_LSRAM_PROP	"rohm,lsram"
 
 /*
  * struct fpga_sampler_dma_desc - one cyclic transfer request
@@ -168,18 +165,11 @@ struct fpga_sampler_dma_chan {
  * struct fpga_sampler_dma - per-device state
  * @dma_dev:       the registered dmaengine device (one per platform_device).
  * @chan:          the single hardware channel exposed by this IP.
- * @regs:          ioremap()'d MMIO window for the DMA_* registers, obtained
- *                 from this device's own "reg" property (index 0) rather
- *                 than a hard-coded address.
- * @lsram_addr:    DMA-bus address of the FPGA sampler's LSRAM aperture
- *                 (the DMA source), obtained from the sampler node's
- *                 "lsram" reg window via device tree - see
- *                 fpga_sampler_dma_of_get_lsram().
- * @lsram_size:    size of that LSRAM aperture, in bytes; used to validate
- *                 that a requested cyclic transfer's period_len evenly
- *                 divides it into the expected number of ping-pong halves.
- * @irq:           DMA completion interrupt (PLIC source 121 on
- *                 BeagleV-Fire).
+ * @regs:          ioremap()'d MMIO window for the DMA_* registers
+ * @lsram_addr:    DMA-bus address of the FPGA's LSRAM aperture (the DMA
+ *                 source)
+ * @lsram_size:    size of that LSRAM aperture, in bytes
+ * @irq:           DMA completion interrupt
  */
 struct fpga_sampler_dma {
 	struct dma_device dma_dev;
@@ -574,60 +564,43 @@ static irqreturn_t fpga_sampler_dma_irq_handler(int irq, void *p)
 }
 
 /**
- * fpga_sampler_dma_of_get_lsram() - resolve the FPGA sampler's LSRAM window
+ * fpga_sampler_dma_of_get_lsram() - resolve the FPGA's LSRAM window
  * @dmac: device state to fill in (lsram_addr/lsram_size)
  * @dev:  this DMA-controller device (its of_node must have a
- *        "rohm,sampler" phandle property pointing at the sampler node)
+ *        "rohm,lsram" phandle property pointing at the standalone
+ *        "lsram@..." node)
  *
- * The LSRAM aperture (the DMA source region the sampler gateware writes
- * ADC samples into) is a property of the *sampler* device's devicetree
- * node, not this DMA-controller node - see
- * mva-ext-dtso/iio-mem-access-overlay.dtso's `fpgasampler` node, which
- * lists it as its second, named "lsram" reg window. This helper follows
- * the "rohm,sampler" phandle from our own node to that sampler node,
- * finds the "lsram"-named reg entry within it via "reg-names", and
- * resolves it to a physical address/size with of_address_to_resource() -
- * without ioremap()'ing it ourselves, since the sampler driver (not this
- * DMA driver) owns that MMIO region and maps it for its own accesses to
- * SPI_RATE_SEL/SPI_TX_WORD/etc.
+ * Get the LSRAM aperture (the DMA source region the sampler gateware writes
+ * ADC samples into)
  *
- * This phandle-based lookup (as opposed to duplicating the "lsram" reg
- * directly onto the DMA-controller node) is a design choice with open
- * questions - see TO-CLARIFY.txt, "DMA-engine provider"
- * section.
+ * This helper simply follows the "rohm,lsram" phandle from our own node
+ * directly to that standalone node and resolves its (only) "reg" entry
+ * to a physical address/size with of_address_to_resource() - without
+ * ioremap()'ing it ourselves, since LSRAM is a DMA source address, not
+ * an MMIO register window any driver needs to access with loads/stores.
  *
- * Return: 0 on success, negative errno on failure (missing property,
- * missing "lsram" reg-names entry, or unresolvable address).
+ * Return: 0 on success, negative errno on failure (missing property or
+ * unresolvable address).
  */
 static int fpga_sampler_dma_of_get_lsram(struct fpga_sampler_dma *dmac,
 					 struct device *dev)
 {
-	struct device_node *sampler_np;
+	struct device_node *lsram_np;
 	struct resource res;
-	int index;
 	int ret;
 
-	sampler_np = of_parse_phandle(dev->of_node,
-				      FPGA_SAMPLER_DMA_OF_SAMPLER_PROP, 0);
-	if (!sampler_np)
+	lsram_np = of_parse_phandle(dev->of_node,
+				    FPGA_SAMPLER_DMA_OF_LSRAM_PROP, 0);
+	if (!lsram_np)
 		return dev_err_probe(dev, -ENODEV,
-				     "missing \"%s\" phandle to FPGA sampler node\n",
-				     FPGA_SAMPLER_DMA_OF_SAMPLER_PROP);
+				     "missing \"%s\" phandle to LSRAM node\n",
+				     FPGA_SAMPLER_DMA_OF_LSRAM_PROP);
 
-	index = of_property_match_string(sampler_np, "reg-names",
-					 FPGA_SAMPLER_DMA_LSRAM_REG_NAME);
-	if (index < 0) {
-		ret = dev_err_probe(dev, index,
-				    "sampler node has no \"%s\" reg-names entry\n",
-				    FPGA_SAMPLER_DMA_LSRAM_REG_NAME);
-		goto out_put;
-	}
-
-	ret = of_address_to_resource(sampler_np, index, &res);
+	ret = of_address_to_resource(lsram_np, 0, &res);
 	if (ret) {
 		ret = dev_err_probe(dev, ret,
-				    "failed to resolve \"%s\" reg from sampler node\n",
-				    FPGA_SAMPLER_DMA_LSRAM_REG_NAME);
+				    "failed to resolve \"reg\" from \"%s\" node\n",
+				    FPGA_SAMPLER_DMA_OF_LSRAM_PROP);
 		goto out_put;
 	}
 
@@ -635,7 +608,7 @@ static int fpga_sampler_dma_of_get_lsram(struct fpga_sampler_dma *dmac,
 	dmac->lsram_size = resource_size(&res);
 
 out_put:
-	of_node_put(sampler_np);
+	of_node_put(lsram_np);
 	return ret;
 }
 
